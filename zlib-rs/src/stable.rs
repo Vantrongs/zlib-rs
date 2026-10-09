@@ -74,6 +74,36 @@ pub struct Inflate {
 }
 
 impl Inflate {
+    /// Heap bytes requested for this decoder's state, history window and alignment.
+    ///
+    /// A successful [`Self::try_clone`] requests the same number of bytes. This
+    /// excludes `size_of::<Self>()` and bookkeeping or rounding inside the system
+    /// allocator. Input and output buffers are owned by the caller.
+    pub fn allocation_size(&self) -> usize {
+        self.inner.allocation_size()
+    }
+
+    /// Copy the decoder at its current position into an independent allocation.
+    ///
+    /// The copy includes the history window, buffered bits, checksum and byte counters.
+    /// It does not retain input or output buffers. Resume with input starting at
+    /// [`Self::total_in`] and a new output buffer; bytes not yet consumed from a previous
+    /// input must be supplied again. Resetting or dropping either decoder does not
+    /// affect the other.
+    ///
+    /// Returns [`InflateError::MemError`] if the copy cannot be allocated.
+    pub fn try_clone(&self) -> Result<Self, InflateError> {
+        let inner = self.inner.try_clone_owned().map_err(|code| match code {
+            ReturnCode::MemError => InflateError::MemError,
+            _ => unreachable!("copying an initialized decoder only fails on allocation"),
+        })?;
+        Ok(Self {
+            inner,
+            total_in: self.total_in,
+            total_out: self.total_out,
+        })
+    }
+
     /// The amount of bytes consumed from the input so far.
     pub fn total_in(&self) -> u64 {
         self.total_in
@@ -422,5 +452,220 @@ impl Deflate {
 impl Drop for Deflate {
     fn drop(&mut self) {
         let _ = crate::deflate::end(&mut self.inner);
+    }
+}
+
+#[cfg(all(test, any(feature = "rust-allocator", feature = "c-allocator")))]
+mod checkpoint_tests {
+    use super::*;
+
+    fn fixture(window_bits: i32) -> (Vec<u8>, Vec<u8>) {
+        let mut plain = b"0123456789abcdef".repeat(4096);
+        plain.extend_from_slice(&b"fedcba9876543210".repeat(4096));
+        let mut compressed = vec![0; crate::compress_bound(plain.len())];
+        let (encoded, status) = crate::compress_slice(
+            &mut compressed,
+            &plain,
+            DeflateConfig {
+                window_bits,
+                ..Default::default()
+            },
+        );
+        assert_eq!(status, ReturnCode::Ok);
+        let len = encoded.len();
+        compressed.truncate(len);
+        (plain, compressed)
+    }
+
+    fn finish(decoder: &mut Inflate, input: &[u8], output_chunk: usize) -> Vec<u8> {
+        let start_in = decoder.total_in();
+        let mut decoded = Vec::new();
+        loop {
+            let before = (decoder.total_in(), decoder.total_out());
+            let offset = (decoder.total_in() - start_in) as usize;
+            let mut output = vec![0; output_chunk];
+            let status = decoder
+                .decompress(&input[offset..], &mut output, InflateFlush::NoFlush)
+                .unwrap();
+            decoded.extend_from_slice(&output[..(decoder.total_out() - before.1) as usize]);
+            if status == Status::StreamEnd {
+                return decoded;
+            }
+            assert_ne!(
+                before,
+                (decoder.total_in(), decoder.total_out()),
+                "decoder stalled"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_resumes_pending_match_without_original_or_borrowed_buffers() {
+        let (plain, encoded) = fixture(15);
+        let mut source = Inflate::new(true, 15);
+        let mut input = encoded.clone();
+        let mut output = vec![0; 113];
+        assert_eq!(
+            source.decompress(&input, &mut output, InflateFlush::NoFlush),
+            Ok(Status::Ok)
+        );
+        assert_eq!(output, plain[..113]);
+        // A nonzero low half is the number of bytes already emitted from a pending match.
+        assert!(crate::inflate::mark(&source.inner) as u32 & 0xffff > 0);
+        let consumed = source.total_in() as usize;
+        input.fill(0);
+        drop(input);
+        output.fill(0);
+        drop(output);
+        let mut first = source.try_clone().unwrap();
+        let mut second = source.try_clone().unwrap();
+        assert_eq!(
+            (first.total_in(), first.total_out()),
+            (source.total_in(), source.total_out())
+        );
+        drop(source);
+        assert_eq!(finish(&mut first, &encoded[consumed..], 257), plain[113..]);
+        first.reset(false);
+        drop(first);
+        assert_eq!(finish(&mut second, &encoded[consumed..], 997), plain[113..]);
+        assert_eq!(second.total_in(), encoded.len() as u64);
+        assert_eq!(second.total_out(), plain.len() as u64);
+    }
+
+    #[test]
+    fn checkpoints_preserve_headers_partial_input_and_wrapped_window() {
+        for (encode_bits, expect_header, decode_bits) in
+            [(-15, false, 15), (15, true, 0), (31, true, 47)]
+        {
+            let (plain, encoded) = fixture(encode_bits);
+            for input_end in [0, 1, 2, 3, 7, 15, 31, encoded.len() - 4, encoded.len()] {
+                for output_end in [0, 1, 7, 113, 32769, 70001] {
+                    let mut source = Inflate::new(expect_header, decode_bits);
+                    let mut buffer = vec![0; output_end];
+                    source
+                        .decompress(&encoded[..input_end], &mut buffer, InflateFlush::NoFlush)
+                        .unwrap();
+                    let consumed = source.total_in() as usize;
+                    let produced = source.total_out() as usize;
+                    assert_eq!(&buffer[..produced], &plain[..produced]);
+                    let mut restored = source.try_clone().unwrap();
+                    // Advancing and resetting the source must not change the checkpoint.
+                    assert_eq!(
+                        finish(&mut source, &encoded[consumed..], 4096),
+                        plain[produced..]
+                    );
+                    source.reset(false);
+                    drop(source);
+                    drop(buffer);
+                    assert_eq!(
+                        finish(&mut restored, &encoded[consumed..], 263),
+                        plain[produced..]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoints_before_decode_after_reset_and_after_end_are_independent() {
+        let (plain, encoded) = fixture(15);
+        let source = Inflate::new(true, 15);
+        let mut pristine = source.try_clone().unwrap();
+        drop(source);
+        assert_eq!(finish(&mut pristine, &encoded, 8192), plain);
+        let mut ended = pristine.try_clone().unwrap();
+        pristine.reset(false);
+        drop(pristine);
+        assert_eq!(
+            ended.decompress(&[], &mut [0; 1], InflateFlush::NoFlush),
+            Ok(Status::StreamEnd)
+        );
+        assert_eq!(
+            (ended.total_in(), ended.total_out()),
+            (encoded.len() as u64, plain.len() as u64)
+        );
+        ended.reset(true);
+        let mut reset = ended.try_clone().unwrap();
+        drop(ended);
+        assert_eq!((reset.total_in(), reset.total_out()), (0, 0));
+        assert_eq!(finish(&mut reset, &encoded, 4096), plain);
+    }
+
+    #[test]
+    fn checkpoint_allocation_failure_leaves_source_usable() {
+        unsafe extern "C" fn fail_alloc(
+            opaque: *mut core::ffi::c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut core::ffi::c_void {
+            // SAFETY: opaque points to requested for the duration of try_clone.
+            unsafe { *opaque.cast::<usize>() = items as usize * size as usize };
+            core::ptr::null_mut()
+        }
+        let (plain, encoded) = fixture(15);
+        let mut source = Inflate::new(true, 15);
+        source
+            .decompress(&encoded, &mut [0; 113], InflateFlush::NoFlush)
+            .unwrap();
+        let consumed = source.total_in() as usize;
+        let allocator = source.inner.alloc;
+        let mut requested = 0usize;
+        source.inner.alloc.zalloc = fail_alloc;
+        source.inner.alloc.opaque = core::ptr::addr_of_mut!(requested).cast();
+        let expected_size = source.allocation_size();
+        assert!(matches!(source.try_clone(), Err(InflateError::MemError)));
+        source.inner.alloc = allocator;
+        assert_eq!(requested, expected_size);
+        let mut restored = source.try_clone().unwrap();
+        assert_eq!(
+            finish(&mut source, &encoded[consumed..], 4096),
+            plain[113..]
+        );
+        drop(source);
+        assert_eq!(
+            finish(&mut restored, &encoded[consumed..], 4096),
+            plain[113..]
+        );
+    }
+
+    #[test]
+    fn checkpoints_preserve_dictionary_and_error_state() {
+        let dictionary = b"0123456789abcdef".repeat(1024);
+        let plain = dictionary.repeat(4);
+        let mut compressor = Deflate::new(6, true, 15);
+        let dict_id = compressor.set_dictionary(&dictionary).unwrap();
+        let mut encoded = vec![0; crate::compress_bound(plain.len())];
+        assert_eq!(
+            compressor.compress(&plain, &mut encoded, DeflateFlush::Finish),
+            Ok(Status::StreamEnd)
+        );
+        encoded.truncate(compressor.total_out() as usize);
+        let mut source = Inflate::new(true, 15);
+        assert_eq!(
+            source.decompress(&encoded, &mut [0; 113], InflateFlush::NoFlush),
+            Err(InflateError::NeedDict { dict_id })
+        );
+        let mut waiting = source.try_clone().unwrap();
+        let consumed = source.total_in() as usize;
+        drop(source);
+        waiting.set_dictionary(&dictionary).unwrap();
+        let mut ready = waiting.try_clone().unwrap();
+        drop(waiting);
+        drop(dictionary);
+        assert_eq!(finish(&mut ready, &encoded[consumed..], 257), plain);
+
+        let mut invalid = Inflate::new(true, 15);
+        assert_eq!(
+            invalid.decompress(&[0xff; 8], &mut [0; 16], InflateFlush::NoFlush),
+            Err(InflateError::DataError)
+        );
+        let message = invalid.error_message();
+        let mut restored = invalid.try_clone().unwrap();
+        drop(invalid);
+        assert_eq!(restored.error_message(), message);
+        assert_eq!(
+            restored.decompress(&[], &mut [0; 16], InflateFlush::NoFlush),
+            Err(InflateError::DataError)
+        );
     }
 }

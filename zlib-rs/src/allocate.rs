@@ -231,6 +231,14 @@ static FAIL: Allocator<'static> = Allocator {
 };
 
 impl Allocator<'_> {
+    pub(crate) fn allocation_size(&self, layout: Layout) -> usize {
+        #[cfg(feature = "rust-allocator")]
+        if self.zalloc == RUST.zalloc {
+            return layout.size();
+        }
+        layout.size() + core::mem::size_of::<*mut c_void>() + layout.align()
+    }
+
     fn allocate_layout(&self, layout: Layout) -> *mut c_void {
         assert!(layout.align() <= ALIGN.into());
 
@@ -264,7 +272,7 @@ impl Allocator<'_> {
         //
         // Of course there does need to be enough space in the allocation such that when we
         // shift the start forwards, the end is still within the allocation. Hence we allocate
-        // `extra_space` bytes: enough for a full alignment plus a pointer.
+        // extra bytes: enough for a full alignment plus a pointer.
 
         // we need at least
         //
@@ -273,11 +281,10 @@ impl Allocator<'_> {
         // - `size_of::<*mut _>` extra space so that after aligning to `align`,
         //      there is `size_of::<*mut _>` space to store the pointer to the allocation.
         //      This pointer is then retrieved in `free`
-        let extra_space = core::mem::size_of::<*mut c_void>() + layout.align();
 
         // Safety: we assume allocating works correctly in the safety assumptions on
         // `DeflateStream` and `InflateStream`.
-        let Ok(allocation_size) = c_uint::try_from(layout.size() + extra_space) else {
+        let Ok(allocation_size) = c_uint::try_from(self.allocation_size(layout)) else {
             return core::ptr::null_mut();
         };
         let ptr = unsafe { (self.zalloc)(self.opaque, allocation_size, 1) };
