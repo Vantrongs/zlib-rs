@@ -74,6 +74,27 @@ pub struct Inflate {
 }
 
 impl Inflate {
+    /// The bytes this decoder's state and history window take from the allocator,
+    /// which a successful [`Self::try_clone`] takes again. Excludes `size_of::<Self>()`
+    /// and the allocator's own bookkeeping.
+    pub fn allocation_size(&self) -> usize {
+        self.inner.allocation_size()
+    }
+
+    /// An independent copy of the decoder at its current position: history window,
+    /// buffered bits, checksum and counters, but no input or output buffer. Resume it
+    /// with the input from [`Self::total_in`] on.
+    pub fn try_clone(&self) -> Result<Self, InflateError> {
+        Ok(Self {
+            inner: self
+                .inner
+                .clone_without_buffers()
+                .ok_or(InflateError::MemError)?,
+            total_in: self.total_in,
+            total_out: self.total_out,
+        })
+    }
+
     /// The amount of bytes consumed from the input so far.
     pub fn total_in(&self) -> u64 {
         self.total_in
@@ -422,5 +443,136 @@ impl Deflate {
 impl Drop for Deflate {
     fn drop(&mut self) {
         let _ = crate::deflate::end(&mut self.inner);
+    }
+}
+
+#[cfg(all(test, any(feature = "rust-allocator", feature = "c-allocator")))]
+mod clone_tests {
+    use super::*;
+
+    fn compressed(window_bits: i32) -> (Vec<u8>, Vec<u8>) {
+        let mut plain = b"0123456789abcdef".repeat(4096);
+        plain.extend_from_slice(&b"fedcba9876543210".repeat(4096));
+        let mut encoded = vec![0; crate::compress_bound(plain.len())];
+        let config = DeflateConfig {
+            window_bits,
+            ..Default::default()
+        };
+        let (written, status) = crate::compress_slice(&mut encoded, &plain, config);
+        assert_eq!(status, ReturnCode::Ok);
+        let len = written.len();
+        encoded.truncate(len);
+        (plain, encoded)
+    }
+
+    /// Decodes the rest of a stream, given the input from `decoder.total_in()` on.
+    fn finish(decoder: &mut Inflate, input: &[u8], chunk: usize) -> Vec<u8> {
+        let start = decoder.total_in();
+        let mut decoded = Vec::new();
+        loop {
+            let out_before = decoder.total_out();
+            let mut output = vec![0; chunk];
+            let offset = (decoder.total_in() - start) as usize;
+            let status = decoder
+                .decompress(&input[offset..], &mut output, InflateFlush::NoFlush)
+                .unwrap();
+            decoded.extend_from_slice(&output[..(decoder.total_out() - out_before) as usize]);
+            if status == Status::StreamEnd {
+                return decoded;
+            }
+        }
+    }
+
+    #[test]
+    fn a_clone_resumes_a_pending_match_after_the_buffers_are_gone() {
+        let (plain, encoded) = compressed(15);
+        let mut source = Inflate::new(true, 15);
+        let mut input = encoded.clone();
+        let mut output = vec![0; 113];
+        source
+            .decompress(&input, &mut output, InflateFlush::NoFlush)
+            .unwrap();
+        // Part of a match is still to be copied.
+        assert!(crate::inflate::mark(&source.inner) & 0xffff > 0);
+        let consumed = source.total_in() as usize;
+        input.fill(0);
+        drop((input, output));
+        let mut first = source.try_clone().unwrap();
+        let mut second = source.try_clone().unwrap();
+        drop(source);
+        assert_eq!(finish(&mut first, &encoded[consumed..], 257), plain[113..]);
+        first.reset(false);
+        drop(first);
+        assert_eq!(finish(&mut second, &encoded[consumed..], 997), plain[113..]);
+    }
+
+    #[test]
+    fn clones_resume_raw_zlib_and_gzip_streams_at_any_point() {
+        for (encode_bits, header, decode_bits) in [(-15, false, 15), (15, true, 0), (31, true, 47)]
+        {
+            let (plain, encoded) = compressed(encode_bits);
+            for input_end in [0, 1, 3, 7, 31, encoded.len() - 4, encoded.len()] {
+                for output_end in [0, 1, 113, 32769, 70001] {
+                    let mut source = Inflate::new(header, decode_bits);
+                    let mut output = vec![0; output_end];
+                    source
+                        .decompress(&encoded[..input_end], &mut output, InflateFlush::NoFlush)
+                        .unwrap();
+                    let (consumed, produced) =
+                        (source.total_in() as usize, source.total_out() as usize);
+                    let mut clone = source.try_clone().unwrap();
+                    let rest = finish(&mut source, &encoded[consumed..], 4096);
+                    assert_eq!(rest, plain[produced..]);
+                    drop(source);
+                    let rest = finish(&mut clone, &encoded[consumed..], 263);
+                    assert_eq!(rest, plain[produced..]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_clone_of_a_new_finished_or_reset_decoder_is_independent() {
+        let (plain, encoded) = compressed(15);
+        let mut new = Inflate::new(true, 15).try_clone().unwrap();
+        assert_eq!(finish(&mut new, &encoded, 8192), plain);
+        let mut finished = new.try_clone().unwrap();
+        new.reset(false);
+        let status = finished.decompress(&[], &mut [0; 1], InflateFlush::NoFlush);
+        assert_eq!(status, Ok(Status::StreamEnd));
+        finished.reset(true);
+        let mut reset = finished.try_clone().unwrap();
+        assert_eq!((reset.total_in(), reset.total_out()), (0, 0));
+        assert_eq!(finish(&mut reset, &encoded, 4096), plain);
+    }
+
+    #[test]
+    fn a_failed_clone_requests_allocation_size_and_leaves_the_source_usable() {
+        unsafe extern "C" fn record_and_fail(
+            opaque: *mut core::ffi::c_void,
+            items: c_uint,
+            size: c_uint,
+        ) -> *mut core::ffi::c_void {
+            // SAFETY: `opaque` points to the test's `requested` during `try_clone`.
+            unsafe { *opaque.cast::<usize>() = items as usize * size as usize };
+            core::ptr::null_mut()
+        }
+        let (plain, encoded) = compressed(15);
+        let mut source = Inflate::new(true, 15);
+        source
+            .decompress(&encoded, &mut [0; 113], InflateFlush::NoFlush)
+            .unwrap();
+        let consumed = source.total_in() as usize;
+        let allocator = source.inner.alloc;
+        let mut requested = 0_usize;
+        source.inner.alloc.zalloc = record_and_fail;
+        source.inner.alloc.opaque = core::ptr::addr_of_mut!(requested).cast();
+        assert!(matches!(source.try_clone(), Err(InflateError::MemError)));
+        assert_eq!(requested, source.allocation_size());
+        source.inner.alloc = allocator;
+        assert_eq!(
+            finish(&mut source, &encoded[consumed..], 4096),
+            plain[113..]
+        );
     }
 }

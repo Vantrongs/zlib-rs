@@ -76,6 +76,36 @@ pub unsafe fn set_mode_sync(strm: *mut z_stream) {
 }
 
 impl<'a> InflateStream<'a> {
+    /// The bytes this stream's state and window take from its allocator.
+    pub(crate) fn allocation_size(&self) -> usize {
+        let layout = core::alloc::Layout::array::<u8>(self.state.total_allocation_size);
+        self.alloc.allocation_size(layout.unwrap())
+    }
+
+    /// A copy with its own state and window and no input or output buffers; `None`
+    /// when the allocation fails.
+    ///
+    /// Unlike [`copy`], this accepts a stream whose buffers are null or gone: the copy
+    /// keeps none of them, and the next [`inflate`] call sets new ones.
+    pub(crate) fn clone_without_buffers(&self) -> Option<Self> {
+        let mut dest = MaybeUninit::uninit();
+        // SAFETY: `self` is a valid stream and `dest` is separate storage. The stable API
+        // never registers a gzip header, the one borrow the copy would share.
+        if unsafe { copy_state(&mut dest, self) } != ReturnCode::Ok {
+            return None;
+        }
+        // SAFETY: `copy_state` initialized `dest`.
+        let mut dest = unsafe { dest.assume_init() };
+        dest.next_in = core::ptr::null_mut();
+        dest.avail_in = 0;
+        dest.next_out = core::ptr::null_mut();
+        dest.avail_out = 0;
+        // SAFETY: an empty slice is valid for reads of zero bytes.
+        unsafe { dest.state.bit_reader.update_slice([].as_ptr(), 0) };
+        dest.state.writer = Writer::new(&mut []);
+        Some(dest)
+    }
+
     // z_stream and DeflateStream must have the same layout. Do our best to check if this is true.
     // (imperfect check, but should catch most mistakes.)
     const _S: () = assert!(core::mem::size_of::<z_stream>() == core::mem::size_of::<Self>());
@@ -2546,10 +2576,16 @@ pub unsafe fn copy<'a>(
         return ReturnCode::StreamError;
     }
 
-    // Safety: source and dest are both mutable references, so guaranteed not to overlap.
-    // dest being a reference to maybe uninitialized memory makes a copy of 1 DeflateStream valid.
-    unsafe { core::ptr::copy_nonoverlapping(source, dest.as_mut_ptr(), 1) };
+    // Safety: the caller guarantees a valid source and a separate destination.
+    unsafe { copy_state(dest, source) }
+}
 
+/// Copies `source` into `dest` with a state and window of its own. `dest` is written only
+/// once the allocation succeeds, so a failed copy leaves nothing to free.
+unsafe fn copy_state<'a>(
+    dest: &mut MaybeUninit<InflateStream<'a>>,
+    source: &InflateStream<'a>,
+) -> ReturnCode {
     // Allocate space.
     let allocs = InflateAllocOffsets::new();
     debug_assert_eq!(allocs.total_size, source.state.total_allocation_size);
@@ -2578,6 +2614,10 @@ pub unsafe fn copy<'a>(
 
     let field_ptr = unsafe { core::ptr::addr_of_mut!((*copy).allocation_start) };
     unsafe { core::ptr::write(field_ptr, allocation_start.as_ptr()) };
+
+    // Safety: source and dest are both references, so guaranteed not to overlap.
+    // dest being a reference to maybe uninitialized memory makes a copy of 1 InflateStream valid.
+    unsafe { core::ptr::copy_nonoverlapping(source, dest.as_mut_ptr(), 1) };
 
     let field_ptr = unsafe { core::ptr::addr_of_mut!((*dest.as_mut_ptr()).state) };
     unsafe { core::ptr::write(field_ptr as *mut *mut State, copy) };
